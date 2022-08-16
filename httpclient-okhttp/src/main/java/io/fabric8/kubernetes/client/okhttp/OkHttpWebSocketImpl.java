@@ -30,6 +30,8 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -39,9 +41,13 @@ class OkHttpWebSocketImpl implements WebSocket {
 
     private Request.Builder builder = new Request.Builder();
     private OkHttpClient httpClient;
+    public CountDownLatch enteredCriticalSectionLatch;
+    public CountDownLatch resumeCriticalSectionLatch;
 
     public BuilderImpl(OkHttpClient httpClient) {
       this.httpClient = httpClient;
+      this.enteredCriticalSectionLatch = new CountDownLatch(1);
+      this.resumeCriticalSectionLatch = new CountDownLatch(1);
     }
 
     @Override
@@ -55,7 +61,7 @@ class OkHttpWebSocketImpl implements WebSocket {
       Request request = builder.build();
       CompletableFuture<WebSocket> future = new CompletableFuture<>();
       httpClient.newWebSocket(request, new WebSocketListener() {
-        private volatile boolean opened;
+        private AtomicBoolean opened = new AtomicBoolean(false);
         private boolean more = true;
         private ReentrantLock lock = new ReentrantLock();
         private Condition moreRequested = lock.newCondition();
@@ -65,7 +71,14 @@ class OkHttpWebSocketImpl implements WebSocket {
           if (response != null) {
             response.close();
           }
-          if (!opened) {
+          if (opened.compareAndSet(false, true)) {
+            try {
+              enteredCriticalSectionLatch.countDown();
+              resumeCriticalSectionLatch.await();
+            } catch (InterruptedException e) {
+              throw new RuntimeException(e);
+            }
+
             if (response != null) {
               try {
                 future.completeExceptionally(
@@ -83,7 +96,23 @@ class OkHttpWebSocketImpl implements WebSocket {
 
         @Override
         public void onOpen(okhttp3.WebSocket webSocket, Response response) {
-          opened = true;
+//          onOpenFixedRace(webSocket, response);
+          onOpenOldImplementation(webSocket, response);
+        }
+
+        private void onOpenFixedRace(okhttp3.WebSocket webSocket, Response response) {
+          if (opened.compareAndSet(false, true)) {
+            if (response != null) {
+              response.close();
+            }
+            OkHttpWebSocketImpl value = new OkHttpWebSocketImpl(webSocket, this::request);
+            listener.onOpen(value);
+            future.complete(value);
+          }
+        }
+
+        private void onOpenOldImplementation(okhttp3.WebSocket webSocket, Response response) {
+          opened.set(true);
           if (response != null) {
             response.close();
           }
